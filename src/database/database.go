@@ -2,7 +2,6 @@ package database
 
 import (
 	"context"
-	"fmt"
 
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -27,10 +26,6 @@ func MustRun() *Database {
 		panic(err)
 	}
 
-	err = client.Database("local").CreateCollection(ctx, "tokens")
-	if err != nil {
-		fmt.Println("collection already exists")
-	}
 	return &Database{
 		Client: client,
 		Ctx:    ctx,
