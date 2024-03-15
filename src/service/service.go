@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"rest-api/src/database"
@@ -12,13 +14,26 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+type refreshDocument struct {
+	Hash string `json:"hash"`
+	Guid string `json:"guid"`
+	Exp  int64  `json:"exp"`
+}
+
+type httpError struct {
+	Error  string `json:"error"`
+	Status int    `json:"statusCode"`
+}
+
+type AccessTokenClaims struct {
+	Guid string `json:"guid"`
+	Exp  int64  `json:"exp"`
+	jwt.RegisteredClaims
+}
+
 type TokenPair struct {
 	AccessToken  string `json:"accessToken"`
 	RefreshToken string `json:"refreshToken"`
-}
-
-type refreshToken struct {
-	exp time.Time
 }
 
 type Service struct {
@@ -31,79 +46,172 @@ func New(db *database.Database) *Service {
 	}
 }
 
-func (s *Service) AddDataToDB(w http.ResponseWriter, req *http.Request) {
-	hash, err := s.generateRefreshToken()
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	_, err = s.db.Client.Database("local").Collection("refreshToken").InsertOne(s.db.Ctx, bson.D{{Key: "hash", Value: hash}, {Key: "guid", Value: req.URL.Query().Get("guid")}})
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-}
-
-// Можно предположить что запрос на этот метод приходит после успешной валидации данных пользователя другим сервисом
-func (s *Service) GetJwtPair(w http.ResponseWriter, req *http.Request) (*TokenPair, error) {
-	// TODO: изменить аргументы функции, чтобы не передавать w и req
-	// здесь получать сразу guid из req
-	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS512,
-		jwt.MapClaims{
-			"guid": req.URL.Query().Get("guid"),
-			"exp":  time.Now().Add(15 * time.Minute).Unix(),
+func (s *Service) GetJwtPair(w http.ResponseWriter, guid string) *TokenPair {
+	if guid == "" {
+		s.errorHandler(w, httpError{
+			Error:  "Bad Request",
+			Status: 400,
 		})
-
-	signedAccessToken, err := accessToken.SignedString([]byte("TOP_SECRET")) // тут в идеале нужно добавить получение ключа из переменной окружения
-	if err != nil {
-		return nil, err
 	}
 
-	hash, err := s.generateRefreshToken()
-
+	// создаю jwt токен c payload в котором есть guid и expiration
+	signedAccessToken, err := s.generateJwt(guid)
 	if err != nil {
-		return nil, err
+		e := httpError{Error: err.Error(), Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
 	}
 
-	filter := bson.D{{Key: "guid", Value: req.URL.Query().Get("guid")}}
+	// создаю хеш из guid
+	hash, err := s.generateRefreshToken(guid)
+
+	if err != nil {
+		e := httpError{Error: "Internal server error", Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
+	}
+
+	exp := time.Unix(time.Now().Unix()+15552000, 0).Unix() //+180 days
+	filter := bson.D{{Key: "guid", Value: guid}}
 	update := bson.D{{
-		Key: "$set", Value: bson.D{{Key: "hash", Value: hash}, {Key: "guid", Value: req.URL.Query().Get("guid")}},
+		Key: "$set", Value: bson.D{{Key: "hash", Value: string(hash)}, {Key: "guid", Value: guid}, {Key: "exp", Value: exp}},
 	}}
 	_, err = s.db.Client.Database("local").Collection("refreshToken").UpdateOne(s.db.Ctx, filter, update)
+
 	if err != nil {
-		return nil, err
+		e := httpError{Error: "Internal server error", Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
 	}
 
 	return &TokenPair{
 		AccessToken:  signedAccessToken,
 		RefreshToken: base64.RawStdEncoding.EncodeToString(hash),
-	}, nil
+	}
 }
 
-func (s *Service) UpdateAccessToken(w http.ResponseWriter, req *http.Request) {
-	// TODO: из req headers auth получить access токен
-	// провалидировать refresh token из body: посмотреть exp
-	// достать из access токена guid
-	// найти по guid запись в бд
-	// провалидировать refresh token из body: сравнить с refresh в бд
-	// создать оба токена
-	// обновить refresh в бд
-	fmt.Println(req)
-}
-
-func (s *Service) generateRefreshToken() ([]byte, error) {
-	var sec int64 = 15552000 //180 days
-	var token = refreshToken{
-		exp: time.Unix(sec, 0),
+func (s *Service) UpdateAccessToken(w http.ResponseWriter, accessToken string, refreshToken string) *TokenPair {
+	// расшифровываю токен
+	token, err := jwt.ParseWithClaims(accessToken, &AccessTokenClaims{}, func(t *jwt.Token) (interface{}, error) {
+		return []byte("TOPSECRET"), nil
+	})
+	if err != nil {
+		e := httpError{Error: "Internal server error", Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
 	}
 
-	hash, err := bcrypt.GenerateFromPassword([]byte(fmt.Sprint(token)), 10)
+	// достаю payload
+	claims, ok := token.Claims.(*AccessTokenClaims)
+	if !ok {
+		e := httpError{Error: "Internal server error", Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
+	}
 
+	// ищу по guid из токена запись в таблице и декодирую запись
+	var r refreshDocument
+	document := s.db.Client.Database("local").Collection("refreshToken").FindOne(s.db.Ctx, bson.D{{Key: "guid", Value: claims.Guid}})
+	document.Decode(&r)
+	if document.Err() != nil {
+		e := httpError{Error: "Internal server error", Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(document.Err())
+		return nil
+	}
+
+	// сравниваю hash из body с hash в бд
+	refreshHash, err := base64.StdEncoding.DecodeString(refreshToken)
+	if err != nil {
+		e := httpError{Error: "Invalid refresh token", Status: 404}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
+	}
+	if !bytes.Equal(refreshHash, []byte(r.Hash)) {
+		e := httpError{Error: "Invalid refresh token", Status: 401}
+		s.errorHandler(w, e)
+		return nil
+	}
+
+	// проверяю не истек ли токен
+	t := time.Now().Unix()
+	exp := r.Exp
+	if t > exp {
+		e := httpError{Error: "Refresh token expired", Status: 401}
+		s.errorHandler(w, e)
+		return nil
+	}
+
+	signedAccessToken, err := s.generateJwt(claims.Guid)
+	if err != nil {
+		e := httpError{Error: err.Error(), Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
+	}
+
+	hash, err := s.generateRefreshToken(claims.Guid)
+
+	if err != nil {
+		e := httpError{Error: "Internal server error", Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
+	}
+
+	expiration := time.Unix(time.Now().Unix()+15552000, 0).Unix() //+180 days
+	filter := bson.D{{Key: "guid", Value: claims.Guid}}
+	update := bson.D{{
+		Key: "$set", Value: bson.D{{Key: "hash", Value: string(hash)}, {Key: "guid", Value: claims.Guid}, {Key: "exp", Value: expiration}},
+	}}
+	_, err = s.db.Client.Database("local").Collection("refreshToken").UpdateOne(s.db.Ctx, filter, update)
+
+	if err != nil {
+		e := httpError{Error: "Internal server error", Status: 500}
+		s.errorHandler(w, e)
+		fmt.Println(err)
+		return nil
+	}
+
+	return &TokenPair{
+		AccessToken:  signedAccessToken,
+		RefreshToken: base64.RawStdEncoding.EncodeToString(hash),
+	}
+}
+
+func (s *Service) generateRefreshToken(guid string) ([]byte, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(guid), 5)
 	if err != nil {
 		return nil, err
 	}
 
 	return hash, nil
+}
+
+func (s *Service) generateJwt(guid string) (string, error) {
+
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS512,
+		AccessTokenClaims{
+			Guid: guid,
+			Exp:  time.Now().Add(15 * time.Minute).Unix(),
+		})
+
+	signedAccessToken, err := accessToken.SignedString([]byte("TOPSECRET"))
+	if err != nil {
+		return "", err
+	}
+
+	return signedAccessToken, nil
+}
+
+func (s *Service) errorHandler(w http.ResponseWriter, e httpError) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(e.Status)
+	json.NewEncoder(w).Encode(e)
 }
