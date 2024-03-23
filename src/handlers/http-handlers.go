@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"rest-api/src/service"
 	"strings"
@@ -25,34 +26,21 @@ func New(service *service.Service) *Handlers {
 
 func (h *Handlers) InitHandlers() *mux.Router {
 	router := mux.NewRouter()
-	router.HandleFunc("/login", h.GetJwtPair).Methods("GET")
-	router.HandleFunc("/refresh", h.UpdateAccessToken).Methods("POST")
-
+	router.HandleFunc("/getOrders", h.GetOrders).Methods("GET")
 	return router
 }
 
-func (h *Handlers) GetJwtPair(w http.ResponseWriter, req *http.Request) {
-	guid := req.URL.Query().Get("guid")
-	res := h.service.GetJwtPair(w, guid)
-
-	if res != nil {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(res)
-	} else {
-		return
+func (h *Handlers) GetOrders(w http.ResponseWriter, req *http.Request) {
+	ordersString := req.URL.Query().Get("orders")
+	splitFunc := func(r rune) bool {
+		return strings.ContainsRune("[],", r)
 	}
-}
-
-func (h *Handlers) UpdateAccessToken(w http.ResponseWriter, req *http.Request) {
-	authHeader := req.Header.Get("Authorization")
-	accessToken := strings.Split(authHeader, "Bearer ")[1]
-
-	var token RefreshReq
-	json.NewDecoder(req.Body).Decode(&token)
-	res := h.service.UpdateAccessToken(w, accessToken, token.RefreshToken)
+	orders := strings.FieldsFunc(ordersString, splitFunc)
+	res := h.service.GetOrders(w, orders)
 
 	if res != nil {
 		w.Header().Set("Content-Type", "application/json")
+		fmt.Println(res)
 		json.NewEncoder(w).Encode(res)
 	} else {
 		return
